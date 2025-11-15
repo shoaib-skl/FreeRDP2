@@ -1,0 +1,157 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Set custom PC name (branding)
+          Rename-Computer -NewName "adnwebs" -Force
+
+          # Enable Remote Desktop and set NLA off (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule (delete if exists, then add)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No rule to delete"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP User" -Description "Created by GitHub Actions"
+          } else {
+            Write-Host "User RDP already exists"
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          Add-Content -Path $env:GITHUB_ENV -Value ("RDP_CREDS=User: RDP | Password: " + $password)
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Download Tailscale Portable (zip)
+        run: |
+          Write-Host "Downloading Tailscale portable ZIP..."
+          $zipPath = Join-Path $env:TEMP "tailscale.zip"
+          $extractDir = Join-Path $env:TEMP "tailscale_portable"
+          if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-windows-amd64.zip" -OutFile $zipPath -UseBasicParsing
+
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+          # try find tailscale.exe inside extracted folder
+          $found = Get-ChildItem -Path $extractDir -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $found) {
+            Write-Error "Portable tailscale.exe not found in archive."
+            exit 1
+          }
+
+          $tsPath = $found.FullName
+          Write-Host "Found portable tailscale at: $tsPath"
+
+          # make it available to later steps
+          Add-Content -Path $env:GITHUB_ENV -Value ("TS_PATH=" + $tsPath)
+
+      - name: Establish Tailscale Connection (portable)
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tsExe = $env:TS_PATH
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "tailscale.exe missing at $tsExe"
+            exit 1
+          }
+          Write-Host "Using Tailscale Portable: $tsExe"
+
+          $tsHostname = "adnwebs-$env:GITHUB_RUN_ID"
+
+          # Run Tailscale up with authkey and hostname
+          & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname=$tsHostname
+
+          # Wait for tailscale IP (retry)
+          $tsIP = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 4
+            try {
+              $ipOut = (& $tsExe ip -4) -join " "
+              $ipOut = $ipOut.Trim()
+            } catch {
+              $ipOut = ""
+            }
+            if ($ipOut -and $ipOut -ne "100.100.100.100") {
+              $tsIP = $ipOut
+              break
+            }
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned. Exiting."
+            exit 1
+          }
+
+          Write-Host "Tailscale IP: $tsIP"
+          Add-Content -Path $env:GITHUB_ENV -Value ("TAILSCALE_IP=" + $tsIP)
+          Add-Content -Path $env:GITHUB_ENV -Value ("TS_HOSTNAME=" + $tsHostname)
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          if (-not $env:TAILSCALE_IP) {
+            Write-Error "No TAILSCALE_IP found in environment."
+            exit 1
+          }
+
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel "Detailed"
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS (adnwebs.com) ==="
+          Write-Host "Hostname: $env:TS_HOSTNAME"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Credentials: $env:RDP_CREDS"
+          Write-Host "Website: https://adnwebs.com"
+          Write-Host "===============================`n"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - adnwebs.com - Use Ctrl+C in workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
